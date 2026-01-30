@@ -1,0 +1,500 @@
+library(dplyr)
+library(readr)
+library(rgbif)
+library(sf)
+
+# ---------- LOAD SPECIES LIST ----------
+# CSV with species names associated with longevity and fecundity data
+species_tab <- read_csv("species.csv")
+
+# Replace "Genus_species" by "Genus species"
+species_vec <- gsub("_", " ", species_tab$Species)
+
+# ---------- GBIF BACKBONE CHECK ----------
+# Query GBIF taxonomic backbone for all species
+bb <- name_backbone_checklist(species_vec)
+
+# Species with valid species-level match
+bb_ok <- bb %>%
+  dplyr::filter(rank == "SPECIES", matchType != "NONE")
+
+# Species without valid species-level match
+bb_bad <- bb %>%
+  dplyr::filter(!(rank == "SPECIES" & matchType != "NONE")) %>%
+  dplyr::pull(scientificName)
+
+# ---------- MANUAL TAXON FIXES ----------
+# Species requiring manual correction of GBIF usageKey
+BotaurusCinnanomeusID      <- 2480849
+TrichoglossusReticulatusID <- NA
+EmblemaRuficaudaID         <- NA
+
+# Replace GBIF usageKey values manually
+bb$usageKey[bb$verbatim_name == "Botaurus cinnamomeus"]      <- BotaurusCinnanomeusID
+bb$usageKey[bb$verbatim_name == "Trichoglossus reticulatus"] <- TrichoglossusReticulatusID
+bb$usageKey[bb$verbatim_name == "Emblema ruficauda"]         <- EmblemaRuficaudaID
+
+# ---------- GBIF TAXON KEYS ----------
+# Keep only non-NA taxon keys
+gbif_taxon_keys <- bb$usageKey[!is.na(bb$usageKey)]
+
+# Replace synonym keys by accepted usage keys
+gbif_taxon_keys[bb$status == "SYNONYM"] <- bb$acceptedUsageKey[bb$status == "SYNONYM"]
+
+# Remove remaining NA values
+gbif_taxon_keys <- gbif_taxon_keys[!is.na(gbif_taxon_keys)]
+
+# ---------- GBIF BULK DOWNLOAD ----------
+occ_download(
+  pred_in("taxonKey", gbif_taxon_keys),
+  pred("hasCoordinate", TRUE),
+  pred("hasGeospatialIssue", FALSE),
+  pred_in("basisOfRecord", c("HUMAN_OBSERVATION",
+                             "PRESERVED_SPECIMEN",
+                             "MATERIAL_SAMPLE")),
+  format = "SIMPLE_CSV",
+  email = "paunavarrosalcedo@gmail.com",   # required
+  user  = "panavarros",                    # required
+  pwd   = "Longboardgirls.-"               # required
+)
+
+# ---------- DOWNLOAD STATUS ----------
+# Replace ID with the one returned by occ_download()
+occ_download_wait("0039430-251025141854904")
+
+# Retrieve and import downloaded data
+gbif_data <- occ_download_get("0039430-251025141854904") %>%
+  occ_download_import()
+
+# ---------- SPECIES NOT DOWNLOADED ----------
+# Species from checklist not present in the GBIF download
+species_vec[!species_vec %in% gbif_data$species]
+
+# ---------- LOAD RAW GBIF FILE ----------
+# Same data as gbif_data, read directly from disk if needed
+Pansi <- read_delim(
+  "0039430-251025141854904/0039430-251025141854904.csv",
+  delim = "\t",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+
+# ---------- REMOVE DUPLICATE COORDINATES ----------
+Pansi_clean <- Pansi[!duplicated(
+  Pansi[, c("species", "decimalLatitude", "decimalLongitude")]
+), ]
+
+# Save cleaned GBIF records
+write.csv(Pansi_clean, "Pansi_clean.csv", row.names = FALSE)
+
+# ---------- FILTER: BIRDS ONLY ----------
+# Keep only birds (exclude amphibians and reptiles)
+Pansi_clean_birds <- Pansi_clean[Pansi_clean$class == "Aves", ]
+
+# ---------- MANUAL DATA ADDITION ----------
+# Species downloaded manually and not retrieved via occ_download
+Euphlyctis_hexadactyla <- read_delim(
+  "Euphlyctis_hexadactyla.csv",
+  delim = "\t",
+  escape_double = FALSE,
+  trim_ws = TRUE,
+  col_types = cols(eventDate = col_character())
+)
+
+Hylarana_nigrovittata <- read_delim(
+  "Hylarana_nigrovittata.csv",
+  delim = "\t",
+  escape_double = FALSE,
+  trim_ws = TRUE,
+  col_types = cols(eventDate = col_character())
+)
+
+# Combine manually downloaded records
+missing_data <- rbind(
+  Euphlyctis_hexadactyla,
+  Hylarana_nigrovittata
+)
+
+# ---------- CLEAN MANUALLY ADDED DATA ----------
+# Remove duplicated records by species and coordinates
+missing_data_clean <- missing_data[!duplicated(
+  missing_data[, c("species", "decimalLatitude", "decimalLongitude")]
+), ]
+
+# ---------- MERGE GBIF AND MANUAL DATA ----------
+# Combine GBIF-cleaned data with manually downloaded records
+Pansi_clean <- rbind(Pansi_clean, missing_data_clean)
+
+# Remove duplicates again as a safety check
+Pansi_cleans <- Pansi_clean[!duplicated(
+  Pansi_clean[, c("species", "decimalLatitude", "decimalLongitude")]
+), ]
+
+# Optional synonym correction (if needed)
+# Pansi_clean$species[Pansi_clean_birds$species == "Myiobius barbatus"] <- "Myiobius sulphureipygius"
+
+# ---------- LOAD DISTRIBUTION SHAPEFILES ----------
+# Read all shapefiles from directory (e.g. BOTW for birds, IUCN for herps)
+shps <- list.files(
+  path = "Mapas",
+  pattern = "\\.shp$",
+  full.names = TRUE
+)
+
+dataHerps <- lapply(shps, st_read) %>%
+  bind_rows()
+
+# Inspect shapefile structure
+head(dataHerps)
+View(dataHerps)
+
+# ---------- SPECIES WITHOUT SHAPEFILES ----------
+# Identify species present in GBIF but absent from shapefiles
+Pansi_herps_no_SF <- unique(Pansi_clean$species)[
+  !unique(Pansi_cleans$species) %in% unique(dataHerps$sci_name)
+]
+
+Pansi_herps_no_SF
+
+# ---------- FILTER SHAPES TO GBIF SPECIES ----------
+# Keep only shapefiles corresponding to species present in GBIF data
+dataGBIF <- dataHerps[
+  dataHerps$sci_name %in% unique(Pansi_clean$species),
+]
+
+# ---------- REMOVE MISSING COORDINATES ----------
+Pansi_clean <- Pansi_clean[!is.na(Pansi_clean$decimalLatitude), ]
+
+# ---------- INITIALIZE POINT-IN-POLYGON DATASET ----------
+# Empty dataframe to store points falling within species polygons
+Pansi_GBIF_IUCN <- data.frame(
+  matrix(ncol = ncol(Pansi_clean), nrow = 0)
+)
+
+# Assign column names
+colnames(Pansi_GBIF_IUCN) <- colnames(Pansi_clean)
+
+# ---------- TRACK SPECIES WITHOUT OVERLAP ----------
+# Species for which no GBIF points fall within polygons
+especies_sin_solape <- c()
+
+# ---------- POINT-IN-POLYGON ANALYSIS ----------
+# Counter for progress messages
+cont <- 1
+
+# Use planar geometry to avoid spherical intersection issues
+sf::sf_use_s2(FALSE)
+
+# Loop over species
+for (i in unique(Pansi_clean$species)) {
+  print(paste("Current species:", i))
+  print(paste("Processing species", cont, "of",
+              length(unique(Pansi_clean$species))))
+  
+  if (i %in% dataGBIF$sci_name) {
+    
+    # Extract GBIF points for species
+    DataGBIF <- as.data.frame(
+      Pansi_clean[Pansi_clean$species == i, ]
+    )
+    
+    DataGBIF_sf <- st_as_sf(
+      DataGBIF,
+      coords = c("decimalLongitude", "decimalLatitude"),
+      crs = 4326
+    )
+    
+    # Extract species polygon
+    PolygonSP <- dataGBIF[dataGBIF$sci_name == i, ]
+    PolygonSP <- st_make_valid(PolygonSP)
+    
+    # Identify points inside polygon
+    inside_mat <- lengths(
+      st_intersects(DataGBIF_sf, PolygonSP)
+    ) > 0
+    
+    Data_inside <- DataGBIF_sf[inside_mat, ]
+    
+    # If no points overlap polygon
+    if (nrow(Data_inside) == 0) {
+      especies_sin_solape <- c(especies_sin_solape, i)
+      cont <- cont + 1
+      next
+    }
+
+
+
+
+
+
+
+
+
+
+    
+  
+  
+  # ---------- EXTRACT COORDINATES FROM GEOMETRY ----------
+    coords <- sf::st_coordinates(Data_inside)
+    
+    # ---------- DROP GEOMETRY ----------
+    # Convert sf object back to data.frame
+    Data_inside_df <- sf::st_drop_geometry(Data_inside)
+    
+    # ---------- ADD COORDINATE COLUMNS ----------
+    Data_inside_df$decimalLongitude <- coords[, "X"]
+    Data_inside_df$decimalLatitude  <- coords[, "Y"]
+    
+    # Ensure column order matches output dataset
+    Data_inside_df <- Data_inside_df[, colnames(Pansi_GBIF_IUCN)]
+    
+    # Append points inside polygons
+    Pansi_GBIF_IUCN <- rbind(Pansi_GBIF_IUCN, Data_inside_df)
+    
+  } else {
+    # Species without available polygon: keep all GBIF points
+    DataGBIF <- Pansi_clean[Pansi_clean$species == i, ]
+    Pansi_GBIF_IUCN <- rbind(Pansi_GBIF_IUCN, DataGBIF)
+  }
+  
+  cont <- cont + 1
+}
+
+# ---------- SPECIES WITHOUT SPATIAL OVERLAP ----------
+especies_sin_solape
+
+# ---------- SAVE POINT-IN-POLYGON DATA ----------
+write.csv(
+  Pansi_GBIF_IUCN,
+  "HerpsEnPoligono.csv",
+  row.names = FALSE
+)
+
+# ---------- FINAL SPECIES LIST ----------
+unique(Pansi_GBIF_IUCN$species)
+
+# ---------- LATITUDINAL FILTER (TROPICS ONLY) ----------
+# Keep records between -23.5° and 23.5°
+Pansi_GBIF_IUCN <- Pansi_GBIF_IUCN[
+  Pansi_GBIF_IUCN$decimalLatitude >= -23.5 &
+  Pansi_GBIF_IUCN$decimalLatitude <=  23.5,
+]
+
+# ---------- CLIMATE DATA FILTERING (DTR & STR) ----------
+library(terra)
+
+# Load rasters
+dtr <- rast("Mean_DTR_CHIRTS_5km.tif")
+str <- rast("Mean_STR_TERRACLIM_5km.tif")
+
+# Extract DTR values
+points_vect <- vect(
+  Pansi_GBIF_IUCN,
+  geom = c("decimalLongitude", "decimalLatitude"),
+  crs = "EPSG:4326"
+)
+
+valsDTR <- extract(dtr, points_vect)
+Pansi_GBIF_IUCN <- Pansi_GBIF_IUCN[valsDTR$mean_DTR > 0, ]
+
+# Extract STR values
+points_vect <- vect(
+  Pansi_GBIF_IUCN,
+  geom = c("decimalLongitude", "decimalLatitude"),
+  crs = "EPSG:4326"
+)
+
+valsSTR <- extract(str, points_vect)
+Pansi_GBIF_IUCN <- Pansi_GBIF_IUCN[!is.na(valsSTR$mean_STR), ]
+
+# ---------- SPECIES-LEVEL SUBSAMPLING ----------
+# Target: maximum 100 points per species
+
+Pansi_herps_data_fin <- data.frame(
+  matrix(ncol = ncol(Pansi_GBIF_IUCN), nrow = 0)
+)
+
+colnames(Pansi_herps_data_fin) <- colnames(Pansi_GBIF_IUCN)
+
+cont <- 1
+set.seed(10923)
+
+for (i in unique(Pansi_GBIF_IUCN$species)) {
+  print(paste("Current species:", i))
+  print(paste("Processing species", cont, "of",
+              length(unique(Pansi_GBIF_IUCN$species))))
+  
+  data_sp <- Pansi_GBIF_IUCN[Pansi_GBIF_IUCN$species == i, ]
+  
+  if (nrow(data_sp) > 100) {
+    sample_sp <- data_sp[sample(nrow(data_sp), 100), ]
+    Pansi_herps_data_fin <- rbind(Pansi_herps_data_fin, sample_sp)
+  } else {
+    Pansi_herps_data_fin <- rbind(Pansi_herps_data_fin, data_sp)
+  }
+  
+  cont <- cont + 1
+}
+
+
+
+
+# ---------- RECORD COUNTS PER SPECIES ----------
+# Number of records obtained per species
+conteo <- table(Pansi_herps_data_fin$species)
+conteo
+
+# Quick visual checks
+barplot(conteo, las = 2, cex.names = 0.7)
+hist(conteo)
+
+# ---------- SAVE FINAL POINT DATASET ----------
+write.csv(
+  Pansi_herps_data_fin,
+  "Pansi_herps_data_fin.csv",
+  row.names = FALSE
+)
+
+# Number of species with final data
+length(unique(Pansi_herps_data_fin$species))
+
+# ---------- DTR AND STR EXTRACTION ----------
+# Load final point dataset
+df <- read.csv("Pansi_herps_data_fin.csv")
+
+# Convert to SpatVector
+points_vect <- vect(
+  df,
+  geom = c("decimalLongitude", "decimalLatitude"),
+  crs  = "EPSG:4326"
+)
+
+# Extract DTR and STR values
+valsDTR <- extract(dtr, points_vect)
+valsSTR <- extract(str, points_vect)
+
+# Attach climate variables to dataframe
+df$dtr_mean <- valsDTR[, 2]   # column 1 = ID, column 2 = value
+df$str_mean <- valsSTR[, 2]
+
+# ---------- SPECIES-LEVEL CLIMATE AVERAGES ----------
+dfAGG <- aggregate(
+  cbind(dtr_mean, str_mean) ~ species,
+  data = df,
+  FUN  = mean,
+  na.rm = TRUE
+)
+
+dfAGG
+
+# ---------- SAVE SPECIES-LEVEL CLIMATE DATA ----------
+write.csv(
+  dfAGG,
+  "Pansi_herps_with_STRandDTR_fin.csv",
+  row.names = FALSE
+)
+
+library(sf)
+library(dplyr)
+library(terra)
+
+# ---------- INITIALIZE RANDOM POINT DATASET ----------
+# Empty dataframe to store simulated points
+Pansi_simu_points <- data.frame(matrix(ncol = ncol(Pansi_clean), nrow = 0))
+colnames(Pansi_simu_points) <- colnames(Pansi_clean)
+
+# Set seed for reproducibility
+set.seed(10923)
+
+# ---------- RANDOM POINT GENERATION FOR NON-OVERLAPPING SPECIES ----------
+for (i in especies_sin_solape) {
+  cat("Generating random points for species:", i, "\n")
+  
+  # Select species polygon
+  PolygonSP <- dataGBIF[dataGBIF$sci_name == i, ]
+  PolygonSP <- st_make_valid(PolygonSP)
+  
+  # Generate up to 100 random points within polygon
+  puntos_sf <- st_sample(PolygonSP, size = 100, type = "random")
+  
+  # Convert geometry to dataframe with lon/lat
+  coords <- st_coordinates(puntos_sf)
+  df_points <- data.frame(
+    species = i,
+    decimalLongitude = coords[, "X"],
+    decimalLatitude  = coords[, "Y"]
+  )
+  
+  # Add empty columns to match Pansi_clean structure
+  extras <- setdiff(colnames(Pansi_clean), colnames(df_points))
+  for (col in extras) df_points[[col]] <- NA
+  
+  # Reorder columns to match Pansi_clean
+  df_points <- df_points[, colnames(Pansi_clean)]
+  
+  # Append to simulated dataset
+  Pansi_simu_points <- rbind(Pansi_simu_points, df_points)
+}
+
+# ---------- CHECK SIMULATED POINTS ----------
+head(Pansi_simu_points)
+table(Pansi_simu_points$species)
+
+# ---------- SAVE SIMULATED POINTS ----------
+write.csv(
+  Pansi_simu_points,
+  "Pansi_simu_points.csv",
+  row.names = FALSE
+)
+
+# ---------- LATITUDINAL FILTER (TROPICS) ----------
+Pansi_simu_points <- Pansi_simu_points[
+  Pansi_simu_points$decimalLatitude >= -23.5 &
+    Pansi_simu_points$decimalLatitude <= 23.5,
+]
+
+# Remove duplicated coordinates (same lon/lat)
+Pansi_simu_points <- Pansi_simu_points[
+  !duplicated(Pansi_simu_points[, c("decimalLongitude", "decimalLatitude")]),
+]
+
+# Final check
+nrow(Pansi_simu_points)
+head(Pansi_simu_points)
+
+# ---------- CLIMATE DATA EXTRACTION FOR SIMULATED POINTS ----------
+dtr <- rast("Mean_DTR_CHIRTS_5km.tif")
+str <- rast("Mean_STR_TERRACLIM_5km.tif")
+
+# Convert simulated points to SpatVector
+points_simu_vect <- vect(
+  Pansi_simu_points,
+  geom = c("decimalLongitude", "decimalLatitude"),
+  crs  = "EPSG:4326"
+)
+
+# Extract DTR and STR values
+valsDTR_simu <- extract(dtr, points_simu_vect)
+valsSTR_simu <- extract(str, points_simu_vect)
+
+# Attach climate variables
+Pansi_simu_points$dtr_mean <- valsDTR_simu[, 2]   # column 1 = ID, column 2 = value
+Pansi_simu_points$str_mean <- valsSTR_simu[, 2]
+
+# ---------- SPECIES-LEVEL CLIMATE AVERAGES (SIMULATED) ----------
+dfAGG_simu <- aggregate(
+  cbind(dtr_mean, str_mean) ~ species,
+  data = Pansi_simu_points,
+  FUN  = mean,
+  na.rm = TRUE
+)
+
+# ---------- SAVE SIMULATED CLIMATE DATA ----------
+write.csv(
+  dfAGG_simu,
+  "Pansi_herps_simu_STR_DTR.csv",
+  row.names = FALSE
+)
+
+# Check results
+head(dfAGG_simu)
