@@ -1,0 +1,268 @@
+# ============================
+# GBIF con resolución de sinónimos + NA cuando no hay datos
+# ============================
+
+
+library(rgbif)
+library(sf)
+library(dplyr)
+library(CoordinateCleaner)
+
+# ---------- PARÁMETROS EDITABLES ----------
+species_csv      <- "species.csv"          # 1a col = nombre científico
+out_points_csv   <- "puntos_gbif.csv"      # salida puntos (lon/lat)
+out_summary_csv  <- "resumen_gbif.csv"     # salida resumen por especie
+
+max_per_species  <- 150   # tope puntos por especie
+min_year         <- 1900  # año mínimo (GBIF 'year')
+max_uncert_m     <- 500   # Opción B: NA o ≤ este umbral (m)
+min_dist_km      <- 2     # separación mínima entre puntos (km)
+set.seed(123)
+
+# ---------- FUNCIONES ----------
+# Resolver nombre en GBIF (maneja sinónimos y evita warnings)
+resolve_name <- function(sp_raw) {
+  sp_clean <- gsub("\\s+", " ", trimws(sp_raw))
+  bb <- try(rgbif::name_backbone(name = sp_clean, rank = "species"), silent = TRUE)
+  if (inherits(bb, "try-error") || is.null(bb) || is.null(bb[["usageKey"]])) {
+    return(list(ok=FALSE, query=sp_clean, status=NA_character_, usageKey=NA_integer_,
+                acceptedKey=NA_integer_, acceptedName=NA_character_, note="sin_match_backbone"))
+  }
+  status   <- if (!is.null(bb[["status"]])   && nzchar(bb[["status"]]))   bb[["status"]]   else NA_character_
+  acc_key  <- if (!is.null(bb[["acceptedKey"]])) bb[["acceptedKey"]] else bb[["usageKey"]]
+  acc_name <- if (!is.null(bb[["accepted"]]) && nzchar(bb[["accepted"]])) bb[["accepted"]] else bb[["scientificName"]]
+  list(ok=TRUE, query=sp_clean, status=status, usageKey=bb[["usageKey"]],
+       acceptedKey=acc_key, acceptedName=acc_name, note=NA_character_)
+}
+
+# Thinning espacial sencillo (greedy). Entrada: sf en EPSG:4326
+thin_points_min_dist <- function(pts_sf_ll, min_dist_m) {
+  if (nrow(pts_sf_ll) == 0) return(pts_sf_ll[0, , drop = FALSE])
+  pts_m <- sf::st_transform(pts_sf_ll, 3857)
+  keep_idx <- integer(0); idx <- sample(seq_len(nrow(pts_m)))
+  for (i in idx) {
+    if (!length(keep_idx)) {
+      keep_idx <- i
+    } else {
+      d <- as.numeric(sf::st_distance(pts_m[i, ], pts_m[keep_idx, ]))
+      if (all(d >= min_dist_m)) keep_idx <- c(keep_idx, i)
+    }
+  }
+  pts_sf_ll[keep_idx, , drop = FALSE]
+}
+
+# Wrapper CC: vector lógico + silencioso; sin test 'centroids'
+cc_keep_mask <- function(dat) {
+  tests_vec <- c("equal","zeros","seas")
+  out <- try(suppressMessages(
+    CoordinateCleaner::clean_coordinates(
+      x = dat, lon = "decimalLongitude", lat = "decimalLatitude",
+      species = "species", tests = tests_vec, value = "spatialvalid"
+    )
+  ), silent = TRUE)
+  if (inherits(out, "try-error") || !is.logical(out)) {
+    out <- suppressMessages(
+      CoordinateCleaner::clean_coordinates(
+        x = dat, lon = "decimalLongitude", lat = "decimalLatitude",
+        species = "species", tests = tests_vec, value = "flagged"
+      )
+    )
+    if (is.data.frame(out)) {
+      if (".summary" %in% names(out)) out <- out$.summary
+      else if ("valid" %in% names(out)) out <- out$valid
+      else out <- as.logical(out[[1]])
+    }
+  }
+  as.logical(out)
+}
+
+# ---------- LECTURA DE ESPECIES ----------
+sp_tab <- read.csv(species_csv, stringsAsFactors = FALSE, check.names = FALSE)
+species_vec <- unique(gsub("\\s+", " ", trimws(sp_tab[[1]])))
+
+# ---------- AUTOSAVE: preparar archivos si no existen ----------
+puntos_cols  <- c("species_input","species_gbif","point_id","lon","lat","gbifID","note")
+resumen_cols <- c("species_input","species_gbif","status_name","n_raw","n_clean","n_thinned","n_usados","note")
+
+if (!file.exists(out_points_csv)) {
+  write.csv(setNames(data.frame(matrix(ncol=length(puntos_cols), nrow=0)), puntos_cols),
+            out_points_csv, row.names = FALSE)
+}
+if (!file.exists(out_summary_csv)) {
+  write.csv(setNames(data.frame(matrix(ncol=length(resumen_cols), nrow=0)), resumen_cols),
+            out_summary_csv, row.names = FALSE)
+}
+
+# ---------- FUNCIONES DE APPEND ROBUSTAS (sin across) ----------
+append_points <- function(df) {
+  old <- try(read.csv(out_points_csv, stringsAsFactors = FALSE, check.names = FALSE), silent = TRUE)
+  if (inherits(old, "try-error") || !is.data.frame(old)) {
+    old <- setNames(data.frame(matrix(ncol=length(puntos_cols), nrow=0)), puntos_cols)
+  }
+  # asegurar columnas y orden
+  for (col in puntos_cols) {
+    if (!col %in% names(old)) old[[col]] <- NA
+    if (!col %in% names(df))  df[[col]]  <- NA
+  }
+  old <- old[, puntos_cols, drop = FALSE]
+  df  <- df[,  puntos_cols, drop = FALSE]
+  # convertir a character de forma robusta (sin across/mutate)
+  for (nm in puntos_cols) {
+    old[[nm]] <- as.character(old[[nm]])
+    df[[nm]]  <- as.character(df[[nm]])
+  }
+  new <- rbind(old, df)
+  utils::write.csv(new, out_points_csv, row.names = FALSE)
+}
+
+append_summary <- function(df) {
+  old <- try(read.csv(out_summary_csv, stringsAsFactors = FALSE, check.names = FALSE), silent = TRUE)
+  if (inherits(old, "try-error") || !is.data.frame(old)) {
+    old <- setNames(data.frame(matrix(ncol=length(resumen_cols), nrow=0)), resumen_cols)
+  }
+  for (col in resumen_cols) {
+    if (!col %in% names(old)) old[[col]] <- NA
+    if (!col %in% names(df))  df[[col]]  <- NA
+  }
+  old <- old[, resumen_cols, drop = FALSE]
+  df  <- df[,  resumen_cols, drop = FALSE]
+  for (nm in resumen_cols) {
+    old[[nm]] <- as.character(old[[nm]])
+    df[[nm]]  <- as.character(df[[nm]])
+  }
+  new <- rbind(old, df)
+  utils::write.csv(new, out_summary_csv, row.names = FALSE)
+}
+
+# ---------- LOOP PRINCIPAL (autosave por especie) ----------
+for (sp in species_vec) {
+  cat("→ Procesando:", sp, "\n")
+  tryCatch({
+    # a) Resolver nombre
+    resn <- resolve_name(sp)
+    if (!isTRUE(resn$ok)) {
+      append_points(data.frame(species_input=sp, species_gbif=NA, point_id=NA,
+                               lon=NA, lat=NA, gbifID=NA, note="sin_match_backbone"))
+      append_summary(data.frame(species_input=sp, species_gbif=NA, status_name=NA,
+                                n_raw=0, n_clean=0, n_thinned=0, n_usados=0, note="sin_match_backbone"))
+      next
+    }
+    
+    # b) Descargar GBIF (seguro)
+    gb_obj <- try(rgbif::occ_data(
+      taxonKey = resn$acceptedKey,
+      hasCoordinate = TRUE,
+      hasGeospatialIssue = FALSE,
+      occurrenceStatus = "PRESENT",
+      year = paste(min_year, 3000, sep = ","),
+      limit = 20000
+    ), silent = TRUE)
+    
+    gb_data <- NULL
+    if (!inherits(gb_obj, "try-error")) {
+      if (!is.null(gb_obj) && !is.null(gb_obj$data) && is.data.frame(gb_obj$data)) gb_data <- gb_obj$data
+    }
+    if (is.null(gb_data) || nrow(gb_data) == 0) {
+      append_points(data.frame(species_input=sp, species_gbif=resn$acceptedName, point_id=NA,
+                               lon=NA, lat=NA, gbifID=NA, note="sin_gbif"))
+      append_summary(data.frame(species_input=sp, species_gbif=resn$acceptedName, status_name=resn$status,
+                                n_raw=0, n_clean=0, n_thinned=0, n_usados=0, note="sin_gbif"))
+      next
+    }
+    
+    raw <- gb_data
+    
+    # Normalizar columnas clave si faltan
+    if (!"coordinateUncertaintyInMeters" %in% names(raw)) raw$coordinateUncertaintyInMeters <- NA_real_
+    if (!"year" %in% names(raw)) raw$year <- NA_integer_
+    if (!"basisOfRecord" %in% names(raw)) raw$basisOfRecord <- NA_character_
+    
+    suppressWarnings({
+      raw$year  <- as.integer(raw$year)
+      raw$coordinateUncertaintyInMeters <- as.numeric(raw$coordinateUncertaintyInMeters)
+      raw$basisOfRecord <- as.character(raw$basisOfRecord)
+    })
+    
+    # c) Filtros básicos (Opción B) — SOLO colección
+    basis_keep <- c("PRESERVED_SPECIMEN", "MATERIAL_SAMPLE")
+    dat <- raw %>%
+      dplyr::filter(!is.na(decimalLatitude), !is.na(decimalLongitude)) %>%
+      dplyr::filter(basisOfRecord %in% basis_keep) %>%
+      dplyr::filter(is.na(coordinateUncertaintyInMeters) |
+                      coordinateUncertaintyInMeters <= max_uncert_m) %>%
+      dplyr::filter(is.na(year) | year >= min_year)
+    
+    n_raw <- nrow(dat)
+    if (n_raw == 0) {
+      append_points(data.frame(species_input=sp, species_gbif=resn$acceptedName, point_id=NA,
+                               lon=NA, lat=NA, gbifID=NA, note="sin_datos_calidad_basica"))
+      append_summary(data.frame(species_input=sp, species_gbif=resn$acceptedName, status_name=resn$status,
+                                n_raw=0, n_clean=0, n_thinned=0, n_usados=0, note="sin_datos_calidad_basica"))
+      next
+    }
+    
+    # d) CoordinateCleaner
+    dat$species <- resn$acceptedName
+    keep_vec <- cc_keep_mask(dat)
+    dat2     <- dat[keep_vec %in% TRUE, , drop = FALSE]
+    n_clean  <- nrow(dat2)
+    if (n_clean == 0) {
+      append_points(data.frame(species_input=sp, species_gbif=resn$acceptedName, point_id=NA,
+                               lon=NA, lat=NA, gbifID=NA, note="sin_datos_calidad"))
+      append_summary(data.frame(species_input=sp, species_gbif=resn$acceptedName, status_name=resn$status,
+                                n_raw=n_raw, n_clean=0, n_thinned=0, n_usados=0, note="sin_datos_calidad"))
+      next
+    }
+    
+    # e) sf + thinning
+    pts_ll <- sf::st_as_sf(dat2, coords = c("decimalLongitude","decimalLatitude"), crs = 4326, remove = FALSE)
+    min_dist_m <- min_dist_km * 1000
+    pts_thin   <- thin_points_min_dist(pts_ll, min_dist_m)
+    n_thin     <- nrow(pts_thin)
+    if (n_thin == 0) {
+      append_points(data.frame(species_input=sp, species_gbif=resn$acceptedName, point_id=NA,
+                               lon=NA, lat=NA, gbifID=NA, note="sin_puntos_despues_thin"))
+      append_summary(data.frame(species_input=sp, species_gbif=resn$acceptedName, status_name=resn$status,
+                                n_raw=n_raw, n_clean=n_clean, n_thinned=0, n_usados=0, note="sin_puntos_despues_thin"))
+      next
+    }
+    
+    # f) Submuestreo hasta tope
+    n_target <- min(max_per_species, n_thin)
+    sel      <- pts_thin[sample(seq_len(n_thin), size = n_target), ]
+    coords   <- sf::st_coordinates(sel)
+    
+    out_sp <- data.frame(
+      species_input = sp,
+      species_gbif  = resn$acceptedName,
+      point_id      = seq_len(n_target),
+      lon           = coords[,1],
+      lat           = coords[,2],
+      gbifID        = sel$gbifID,
+      note          = "gbif_clean_thin_random",
+      stringsAsFactors = FALSE
+    )
+    append_points(out_sp)
+    
+    append_summary(data.frame(
+      species_input = sp,
+      species_gbif  = resn$acceptedName,
+      status_name   = resn$status,
+      n_raw = n_raw, n_clean = n_clean, n_thinned = n_thin, n_usados = n_target,
+      note = if (n_target < max_per_species) "limitado_por_disponibilidad" else "ok",
+      stringsAsFactors = FALSE
+    ))
+    
+    cat(sprintf("   n_raw: %d | n_clean: %d | n_thinned: %d | n_usados: %d\n",
+                n_raw, n_clean, n_thin, n_target))
+    
+  }, error = function(e) {
+    message("   [ERROR] ", sp, " -> ", conditionMessage(e))
+    append_points(data.frame(species_input=sp, species_gbif=NA, point_id=NA,
+                             lon=NA, lat=NA, gbifID=NA, note="error_en_procesamiento"))
+    append_summary(data.frame(species_input=sp, species_gbif=NA, status_name=NA,
+                              n_raw=NA, n_clean=NA, n_thinned=NA, n_usados=0, note="error_en_procesamiento"))
+  })
+}
+
+cat("Listo.\n- Puntos:  ", out_points_csv,  "\n- Resumen: ", out_summary_csv, "\n")
